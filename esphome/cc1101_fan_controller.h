@@ -16,15 +16,18 @@ static const uint16_t FAN_CMD_TOGGLE = 0x191;  // 110010001
 static const uint16_t FAN_CMD_LIGHT  = 0x0B5;  // 010110101
 static const uint16_t FAN_CMD_INVERT = 0x12B;  // 100101011
 
-// OOK timing (microseconds), derived from captured signals
-static const int OOK_SHORT_US = 370;
-static const int OOK_LONG_US  = 1100;
-static const int OOK_GAP_US   = 6000;
-static const int OOK_TX_REPS  = 12;
+// OOK timings (microseconds), estimated from the recorded 0x093 frames.
+// Receiver captures show asymmetric mark/space intervals, so keep each
+// symbol's mark and space duration separate rather than using complements.
+static const int OOK_MARK_0_US  = 275;
+static const int OOK_SPACE_0_US = 725;
+static const int OOK_MARK_1_US  = 750;
+static const int OOK_SPACE_1_US = 250;
+static const int OOK_GAP_US     = 7580;
+static const int OOK_TX_REPS    = 3;
 static const int OOK_MSG_BITS = 29;  // 20-bit address + 9-bit command
-// The protocol is actually 30 bits: 29 data bits + 1 even-parity bit.
-// The parity bit (trailing mark) is LONG=1 or SHORT=0 so the total
-// number of '1' bits across all 30 is always even.
+// Captures show 33 symbols: 29 address/command bits, 3 zero trailer bits,
+// then one trailing parity symbol. The captured 0x0B3 frame has even parity.
 
 // ============================================================
 // Hardware pin defaults — must match your wiring
@@ -61,6 +64,8 @@ class CC1101FanController {
 public:
     static constexpr int MAX_CHANGES = 512;
     static volatile int rec_timings_[MAX_CHANGES];
+    static volatile int rec_levels_[MAX_CHANGES];
+    static volatile int rec_initial_level_;
     static volatile int rec_count_;
     static volatile long rec_last_us_;
     static volatile bool rec_signal_detected_;
@@ -98,18 +103,32 @@ public:
 
         uint32_t msg = ((address & 0xFFFFF) << 9) | (command & 0x1FF);
 
+        // The captures contain three zero symbols after the 29-bit payload.
         int ones = __builtin_popcount(msg);
         bool parity = odd_parity ? !(ones & 1) : (ones & 1);
+        char tx_bits[34];
+        for (int bit = 28; bit >= 0; bit--)
+            tx_bits[28 - bit] = (msg & (1UL << bit)) ? '1' : '0';
+        tx_bits[29] = '0';
+        tx_bits[30] = '0';
+        tx_bits[31] = '0';
+        tx_bits[32] = parity ? '1' : '0';
+        tx_bits[33] = '\0';
+        ESP_LOGI("cc1101_tx", "addr=0x%05lX cmd=0x%03X frame33=%s parity=%s reps=%d gap=%dus",
+                 (unsigned long)address, command, tx_bits, odd_parity ? "odd" : "even", OOK_TX_REPS, OOK_GAP_US);
+        ESP_LOGI("cc1101_tx", "TX timing: bit1 mark/space=%d/%dus; bit0=%d/%dus",
+                 OOK_MARK_1_US, OOK_SPACE_1_US, OOK_MARK_0_US, OOK_SPACE_0_US);
 
         radio_.setTx();
+        pinMode(gdo0_, OUTPUT);
         delayMicroseconds(500);
 
         // Preamble: alternating pulses to wake the receiver's AGC
         for (int i = 0; i < 12; i++) {
             digitalWrite(gdo0_, HIGH);
-            delayMicroseconds(OOK_LONG_US);
+            delayMicroseconds(OOK_MARK_1_US);
             digitalWrite(gdo0_, LOW);
-            delayMicroseconds(OOK_SHORT_US);
+            delayMicroseconds(OOK_SPACE_1_US);
         }
         delayMicroseconds(OOK_GAP_US);
 
@@ -119,13 +138,20 @@ public:
             for (int b = OOK_MSG_BITS - 1; b >= 0; b--) {
                 bool one = msg & (1UL << b);
                 digitalWrite(gdo0_, HIGH);
-                delayMicroseconds(one ? OOK_LONG_US : OOK_SHORT_US);
+                delayMicroseconds(one ? OOK_MARK_1_US : OOK_MARK_0_US);
                 digitalWrite(gdo0_, LOW);
-                delayMicroseconds(one ? OOK_SHORT_US : OOK_LONG_US);
+                delayMicroseconds(one ? OOK_SPACE_1_US : OOK_SPACE_0_US);
             }
-            // 30th bit: even-parity trailing mark
+            // Three captured zero trailer symbols follow the payload.
+            for (int trailer_bit = 0; trailer_bit < 3; trailer_bit++) {
+                digitalWrite(gdo0_, HIGH);
+                delayMicroseconds(OOK_MARK_0_US);
+                digitalWrite(gdo0_, LOW);
+                delayMicroseconds(OOK_SPACE_0_US);
+            }
+            // Final parity symbol; default is even parity based on captured 0x0B3.
             digitalWrite(gdo0_, HIGH);
-            delayMicroseconds(parity ? OOK_LONG_US : OOK_SHORT_US);
+            delayMicroseconds(parity ? OOK_MARK_1_US : OOK_MARK_0_US);
             digitalWrite(gdo0_, LOW);
 
             portEXIT_CRITICAL(&rf_mux_);
@@ -148,11 +174,12 @@ public:
 
         rec_signal_detected_ = false;
         rec_count_ = 0;
-        rec_last_us_ = micros();
-        rec_active_ = true;
 
         radio_.setRx();
         pinMode(gdo2_, INPUT);
+        rec_initial_level_ = digitalRead(gdo2_);
+        rec_last_us_ = micros();
+        rec_active_ = true;
         attachInterrupt(digitalPinToInterrupt(gdo2_), rf_record_isr, CHANGE);
 
         unsigned long start = millis();
@@ -190,65 +217,124 @@ public:
         }
         ESP_LOGI("cc1101", "]");
 
+        log_timing_analysis(count);
         decode_signal(count);
     }
 
 private:
-    void decode_signal(int count) {
-        // Try to find repeated 30-bit frames in the captured data.
-        // A SHORT pulse (~370us) = 0, a LONG pulse (~1100us) = 1.
-        // Each bit is a mark+space pair; the mark duration encodes the bit.
-        // Look for a gap (>3000us) as frame separator.
+    void log_timing_analysis(int count) {
+        int high_bins[13] = {};
+        int low_bins[13] = {};
+        int level = rec_initial_level_;
+        String edge_line;
 
-        for (int start = 0; start < count - 60; start++) {
-            if (rec_timings_[start] < 3000) continue;
-
-            // Found a gap — try to decode 30 bits starting after it
-            uint32_t frame = 0;
-            int bits_decoded = 0;
-            int pos = start + 1;
-
-            while (bits_decoded < 30 && pos + 1 < count) {
-                int mark = rec_timings_[pos];
-                if (mark < 100 || mark > 2000) break;
-
-                bool is_one = (mark > 700);
-                frame = (frame << 1) | (is_one ? 1 : 0);
-                bits_decoded++;
-                pos += 2; // skip mark + space
-            }
-
-            if (bits_decoded >= 29) {
-                uint32_t full30 = frame;
-                uint32_t msg29 = full30 >> 1;
-                uint32_t address = (msg29 >> 9) & 0xFFFFF;
-                uint16_t command = msg29 & 0x1FF;
-                bool parity_bit = full30 & 1;
-
-                ESP_LOGI("cc1101", "=== DECODED FRAME ===");
-                ESP_LOGI("cc1101", "  30-bit frame : 0x%08X", full30);
-                ESP_LOGI("cc1101", "  29-bit msg   : 0x%08X", msg29);
-                ESP_LOGI("cc1101", "  Address (20b): 0x%05X", address);
-                ESP_LOGI("cc1101", "  Command (9b) : 0x%03X", command);
-                ESP_LOGI("cc1101", "  Parity bit   : %d", parity_bit);
-
-                // Print command in binary for easy comparison
-                char cmd_bin[10];
-                for (int b = 8; b >= 0; b--) {
-                    cmd_bin[8 - b] = (command & (1 << b)) ? '1' : '0';
+        ESP_LOGI("rf_timing", "Intervals are index:level/duration; level is RX output during that interval.");
+        for (int i = 0; i < count; i++) {
+            const int duration = rec_timings_[i];
+            if (duration >= 5000) {
+                ESP_LOGI("rf_timing", "GAP index=%d duration=%dus", i, duration);
+            } else {
+                int bin = duration / 100;
+                if (bin > 11) bin = 12;
+                if (level) high_bins[bin]++;
+                else low_bins[bin]++;
+                edge_line += String(i) + ":" + String(level) + "/" + String(duration) + " ";
+                if (edge_line.length() >= 220) {
+                    ESP_LOGI("rf_timing", "%s", edge_line.c_str());
+                    edge_line = "";
                 }
-                cmd_bin[9] = '\0';
-                ESP_LOGI("cc1101", "  Command (bin): %s", cmd_bin);
-                return;
+            }
+            level = rec_levels_[i];
+        }
+        if (edge_line.length()) ESP_LOGI("rf_timing", "%s", edge_line.c_str());
+
+        for (int bin = 0; bin < 13; bin++) {
+            const int low = bin * 100;
+            if (bin == 12) {
+                if (high_bins[bin]) ESP_LOGI("rf_timing", "RX level 1: >=1200 us=%d samples", high_bins[bin]);
+                if (low_bins[bin]) ESP_LOGI("rf_timing", "RX level 0: >=1200 us=%d samples", low_bins[bin]);
+            } else {
+                const int high = low + 99;
+                if (high_bins[bin]) ESP_LOGI("rf_timing", "RX level 1: %d-%d us=%d samples", low, high, high_bins[bin]);
+                if (low_bins[bin]) ESP_LOGI("rf_timing", "RX level 0: %d-%d us=%d samples", low, high, low_bins[bin]);
             }
         }
+    }
 
-        ESP_LOGW("cc1101", "Could not decode a valid frame from the captured data.");
+    void decode_signal(int count) {
+        int frames = 0;
+        uint32_t previous_in_capture = 0;
+        bool have_previous_in_capture = false;
+        uint32_t changed_in_capture = 0;
+        uint32_t first_message = 0;
+        static uint32_t previous_capture_message = 0;
+        static bool have_previous_capture = false;
+
+        // Use the next long gap as the end of a frame. Do not assume frame
+        // length or that the trailer is a parity bit: captures contain more
+        // symbols than the 29 address/command bits.
+        for (int gap = 0; gap < count; gap++) {
+            if (rec_timings_[gap] < 5000) continue;
+            const int first_mark = gap + 1;
+            int end = first_mark;
+            while (end < count && rec_timings_[end] < 5000) end++;
+
+            const int intervals = end - first_mark;
+            const int symbols = (intervals + 1) / 2;
+            if (symbols < OOK_MSG_BITS || symbols > 60) continue;
+
+            char bits[61];
+            uint32_t message29 = 0;
+            bool valid = true;
+            for (int bit = 0; bit < symbols; bit++) {
+                const int mark_index = first_mark + bit * 2;
+                if (mark_index >= end) { valid = false; break; }
+                const bool one = rec_timings_[mark_index] > 500;
+                bits[bit] = one ? '1' : '0';
+                if (bit < OOK_MSG_BITS) message29 = (message29 << 1) | (one ? 1U : 0U);
+            }
+            if (!valid) continue;
+            bits[symbols] = '\0';
+
+            const uint32_t address = (message29 >> 9) & 0xFFFFF;
+            const uint16_t command = message29 & 0x1FF;
+            const char *suffix = symbols > OOK_MSG_BITS ? bits + OOK_MSG_BITS : "(none)";
+
+            frames++;
+            if (frames == 1) first_message = message29;
+            if (have_previous_in_capture) changed_in_capture |= message29 ^ previous_in_capture;
+            previous_in_capture = message29;
+            have_previous_in_capture = true;
+
+            ESP_LOGI("rf_decode", "Frame %d: symbols=%d addr=0x%05lX cmd=0x%03X suffix-after-29=%s bits=%s",
+                     frames, symbols, (unsigned long)address, (unsigned int)command, suffix, bits);
+        }
+
+        if (frames == 0) {
+            ESP_LOGW("rf_decode", "No frame with at least 29 symbols found.");
+            return;
+        }
+        ESP_LOGI("rf_decode", "Capture summary: %d frames; changed bits in first 29 symbols=0x%08lX",
+                 frames, (unsigned long)changed_in_capture);
+        if (have_previous_capture) {
+            const uint32_t delta = first_message ^ previous_capture_message;
+            ESP_LOGI("rf_decode", "First 29 symbols vs previous Record press: XOR=0x%08lX",
+                     (unsigned long)delta);
+            ESP_LOGI("rf_decode", "Changed address bits=0x%05lX; changed command bits=0x%03lX",
+                     (unsigned long)((delta >> 9) & 0xFFFFF),
+                     (unsigned long)(delta & 0x1FF));
+        } else {
+            ESP_LOGI("rf_decode", "Record again after another remote-button press to compare.");
+        }
+        previous_capture_message = first_message;
+        have_previous_capture = true;
     }
 };
 
 // Static member definitions
 volatile int CC1101FanController::rec_timings_[CC1101FanController::MAX_CHANGES];
+volatile int CC1101FanController::rec_levels_[CC1101FanController::MAX_CHANGES];
+volatile int CC1101FanController::rec_initial_level_ = 0;
 volatile int CC1101FanController::rec_count_ = 0;
 volatile long CC1101FanController::rec_last_us_ = 0;
 volatile bool CC1101FanController::rec_signal_detected_ = false;
@@ -259,8 +345,11 @@ static void IRAM_ATTR rf_record_isr() {
         CC1101FanController::rec_count_ >= CC1101FanController::MAX_CHANGES)
         return;
     long now = micros();
-    CC1101FanController::rec_timings_[CC1101FanController::rec_count_++] =
+    int index = CC1101FanController::rec_count_;
+    CC1101FanController::rec_timings_[index] =
         (int)(now - CC1101FanController::rec_last_us_);
+    CC1101FanController::rec_levels_[index] = digitalRead(CC1101_GDO2_PIN);
+    CC1101FanController::rec_count_ = index + 1;
     CC1101FanController::rec_last_us_ = now;
     CC1101FanController::rec_signal_detected_ = true;
 }

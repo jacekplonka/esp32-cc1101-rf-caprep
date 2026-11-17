@@ -164,6 +164,23 @@ public:
         ESP_LOGD("cc1101", "TX  addr=0x%05X  cmd=0x%03X", address, command);
     }
 
+    void send_cyclic_command(uint32_t address, uint16_t command_prefix, int &next_nibble, uint8_t step, int excluded_nibble = -1) {
+        uint8_t nibble = next_nibble & 0x0F;
+        if (excluded_nibble >= 0 && nibble == (excluded_nibble & 0x0F))
+            nibble = (nibble + step) & 0x0F;
+        const uint16_t command = (command_prefix & 0x1F0) | nibble;
+        ESP_LOGI("cc1101_seq", "addr=0x%05lX prefix=0x%03X nibble=0x%X step=+%u",
+                 (unsigned long)address, command_prefix, nibble, step);
+        if (!ready_) {
+            send_command(address, command);
+            return;
+        }
+        send_command(address, command);
+        uint8_t next = (nibble + step) & 0x0F;
+        if (excluded_nibble >= 0 && next == (excluded_nibble & 0x0F))
+            next = (next + step) & 0x0F;
+        next_nibble = next;
+    }
     void record_signal() {
         if (!ready_) {
             ESP_LOGW("cc1101", "Not initialised — skipping RX record");

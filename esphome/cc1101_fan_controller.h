@@ -59,28 +59,34 @@ static const int OOK_MSG_BITS = 29;  // 20-bit address + 9-bit command
 static void IRAM_ATTR rf_record_isr();
 
 class CC1101FanController {
+    static constexpr uint8_t FAN_COUNT = 2;
     CC1101 radio_;
     int gdo0_;
     int gdo2_;
     bool ready_ = false;
     bool listening_ = false;
     bool log_next_capture_ = false;
+    bool configuration_initialized_ = false;
     portMUX_TYPE rf_mux_ = portMUX_INITIALIZER_UNLOCKED;
 
     struct SequencePool {
         uint16_t prefix;
         uint8_t step;
         int excluded_nibble;
-        int next_nibble;
     } pools_[6] = {};
+
+    struct FanState {
+        uint32_t address;
+        int next_nibble[6];
+        int power_state;
+        int speed_state;
+        int light_state;
+    } fans_[FAN_COUNT] = {};
 
     int last_remote_address_ = -1;
     int last_remote_command_ = -1;
     int last_fan_command_ = -1;
     int discovered_address_ = -1;
-    int fan_power_state_ = -1;
-    int fan_speed_state_ = -1;
-    int light_state_ = -1;
     bool state_dirty_ = false;
     bool discovery_mode_ = false;
     bool repeated_send_active_ = false;
@@ -96,6 +102,7 @@ class CC1101FanController {
     uint8_t burst_command_index_ = 0;
     uint32_t burst_send_next_ms_ = 0;
     int burst_final_speed_ = -1;
+    uint8_t burst_fan_index_ = 0;
     uint32_t last_observed_message_ = 0;
     uint32_t last_observed_ms_ = 0;
 
@@ -111,28 +118,51 @@ public:
     static volatile bool rec_active_;
 
     CC1101FanController(int sck, int miso, int mosi, int cs, int gdo0, int gdo2)
-        : radio_(sck, miso, mosi, cs, gdo0, gdo2), gdo0_(gdo0), gdo2_(gdo2) {}
+        : radio_(sck, miso, mosi, cs, gdo0, gdo2), gdo0_(gdo0), gdo2_(gdo2) {
+        ensure_configuration_();
+    }
 
     // Load ESPHome's restored globals into local state. The main YAML lambda
     // copies updates back into those globals after loop() processes a frame.
     void restore_state(int dimmer, int brighter, int color_temperature,
                        int faster, int slower, int light_toggle,
+                       int dimmer_2, int brighter_2, int color_temperature_2,
+                       int faster_2, int slower_2, int light_toggle_2,
                        int last_address, int last_command, int last_fan_command,
                        int discovered_address,
-                       int fan_power, int fan_speed, int light) {
-        pools_[0] = {0x150, 2, -1, dimmer};
-        pools_[1] = {0x100, 2, -1, brighter};
-        pools_[2] = {0x0B0, 4, 7, color_temperature};
-        pools_[3] = {FAN_CMD_FASTER_PREFIX, FAN_CMD_FASTER_STEP, -1, faster};
-        pools_[4] = {FAN_CMD_SLOWER_PREFIX, FAN_CMD_SLOWER_STEP, -1, slower};
-        pools_[5] = {0x160, 2, -1, light_toggle};
+                       int fan_power, int fan_speed, int light,
+                       int fan_power_2, int fan_speed_2, int light_2) {
+        ensure_configuration_();
+        pools_[0] = {0x150, 2, -1};
+        pools_[1] = {0x100, 2, -1};
+        pools_[2] = {0x0B0, 4, 7};
+        pools_[3] = {FAN_CMD_FASTER_PREFIX, FAN_CMD_FASTER_STEP, -1};
+        pools_[4] = {FAN_CMD_SLOWER_PREFIX, FAN_CMD_SLOWER_STEP, -1};
+        pools_[5] = {0x160, 2, -1};
+        fans_[0].address = 0x94120;
+        fans_[0].next_nibble[0] = dimmer;
+        fans_[0].next_nibble[1] = brighter;
+        fans_[0].next_nibble[2] = color_temperature;
+        fans_[0].next_nibble[3] = faster;
+        fans_[0].next_nibble[4] = slower;
+        fans_[0].next_nibble[5] = light_toggle;
+        fans_[1].address = 0x64120;
+        fans_[1].next_nibble[0] = dimmer_2;
+        fans_[1].next_nibble[1] = brighter_2;
+        fans_[1].next_nibble[2] = color_temperature_2;
+        fans_[1].next_nibble[3] = faster_2;
+        fans_[1].next_nibble[4] = slower_2;
+        fans_[1].next_nibble[5] = light_toggle_2;
+        fans_[0].power_state = fan_power;
+        fans_[0].speed_state = fan_speed;
+        fans_[0].light_state = light;
+        fans_[1].power_state = fan_power_2;
+        fans_[1].speed_state = fan_speed_2;
+        fans_[1].light_state = light_2;
         last_remote_address_ = last_address;
         last_remote_command_ = last_command;
         last_fan_command_ = last_fan_command;
         discovered_address_ = discovered_address;
-        fan_power_state_ = fan_power;
-        fan_speed_state_ = fan_speed;
-        light_state_ = light;
         state_dirty_ = false;
     }
 
@@ -141,22 +171,62 @@ public:
         state_dirty_ = false;
         return true;
     }
-    int sequence_cursor(uint8_t pool) const { return pool < 6 ? pools_[pool].next_nibble : 0; }
+    int sequence_cursor(uint8_t fan, uint8_t pool) const {
+        return fan < FAN_COUNT && pool < 6 ? fans_[fan].next_nibble[pool] : 0;
+    }
     int last_remote_address() const { return last_remote_address_; }
     int last_remote_command() const { return last_remote_command_; }
     int last_fan_command() const { return last_fan_command_; }
     int discovered_address() const { return discovered_address_; }
     bool discovery_mode() const { return discovery_mode_; }
-    int fan_power_state() const { return fan_power_state_; }
-    int fan_speed_state() const { return fan_speed_state_; }
-    int light_state() const { return light_state_; }
+    int fan_power_state(uint8_t fan) const { return fan < FAN_COUNT ? fans_[fan].power_state : -1; }
+    int fan_speed_state(uint8_t fan) const { return fan < FAN_COUNT ? fans_[fan].speed_state : -1; }
+    int light_state(uint8_t fan) const { return fan < FAN_COUNT ? fans_[fan].light_state : -1; }
+    uint32_t fan_address(uint8_t fan) const { return fan < FAN_COUNT ? fans_[fan].address : 0; }
 
     void set_discovery_mode(bool enabled) {
         discovery_mode_ = enabled;
         ESP_LOGI("cc1101_discovery", enabled ? "address discovery enabled" : "address discovery disabled");
     }
 
+    // Home Assistant-facing operations. RF codes and command-pool details stay
+    // in this header; the YAML only selects which configured fan is controlled.
+    void fan_on(uint8_t fan) { send_fixed_command_(fan, 0x020); }
+    void fan_off(uint8_t fan) { send_fixed_command_(fan, 0x093); }
+    void fan_light_toggle(uint8_t fan) { send_pool_command_(fan, 5); }
+    void fan_color_temperature(uint8_t fan) { send_pool_command_(fan, 2); }
+    void fan_direction_toggle(uint8_t fan) { send_fixed_command_(fan, 0x0E4); }
+    void fan_dimmer(uint8_t fan) { send_pool_command_(fan, 0); }
+    void fan_brighter(uint8_t fan) { send_pool_command_(fan, 1); }
+    void fan_max_brightness(uint8_t fan) { repeat_pool_command_(fan, 1, 7000); }
+    void fan_min_brightness(uint8_t fan) { repeat_pool_command_(fan, 0, 7000); }
+    void fan_speed_up(uint8_t fan) { send_pool_command_(fan, 3); }
+    void fan_speed_down(uint8_t fan) { send_pool_command_(fan, 4); }
+    void fan_set_speed(uint8_t fan, int target_speed) {
+        ensure_configuration_();
+        if (fan >= FAN_COUNT || target_speed < 1) return;
+        if (target_speed > 6) target_speed = 6;
+
+        if (fans_[fan].power_state == 0) send_fixed_command_(fan, 0x020);
+        int current_speed = fans_[fan].speed_state;
+        if (current_speed < 1) current_speed = 1;
+        while (current_speed < target_speed) {
+            send_pool_command_(fan, 3);
+            current_speed++;
+        }
+        while (current_speed > target_speed) {
+            send_pool_command_(fan, 4);
+            current_speed--;
+        }
+        fans_[fan].power_state = 1;
+        fans_[fan].speed_state = target_speed;
+        state_dirty_ = true;
+    }
+    void fan_max_speed(uint8_t fan) { burst_pool_commands_(fan, 3, 5); }
+    void fan_min_speed(uint8_t fan) { burst_pool_commands_(fan, 4, 5); }
+
     bool begin() {
+        ensure_configuration_();
         radio_.init();
         radio_.setMHZ(433.92);
         radio_.setTXPwr(TX_PLUS_10_DBM);
@@ -175,7 +245,8 @@ public:
         ready_ = true;
         ESP_LOGI("cc1101", "CC1101 OK  part=0x%02X  ver=0x%02X  433.92 MHz ASK/OOK", partnum, version);
         start_listening_();
-        ESP_LOGI("cc1101", "Continuous RX listening for fan address 0x94120");
+        ESP_LOGI("cc1101", "Continuous RX ready: fan 0x%05lX, fan 0x%05lX",
+                 (unsigned long)fans_[0].address, (unsigned long)fans_[1].address);
         return true;
     }
 
@@ -222,6 +293,11 @@ public:
         }
         if (!ready_) {
             ESP_LOGW("cc1101", "Not initialised — skipping TX");
+            return;
+        }
+        if (address == 0 || address > 0xFFFFF) {
+            ESP_LOGE("cc1101", "Refusing TX with invalid fan address 0x%08lX",
+                     (unsigned long)address);
             return;
         }
 
@@ -357,6 +433,7 @@ public:
         burst_send_active_ = true;
         burst_send_address_ = address;
         burst_command_index_ = 0;
+        burst_fan_index_ = (uint8_t)find_fan_index_(address);
         burst_final_speed_ = command_prefix == FAN_CMD_FASTER_PREFIX ? 6 :
                              command_prefix == FAN_CMD_SLOWER_PREFIX ? 1 : -1;
         ESP_LOGI("cc1101_seq", "sending %u distinct codes from prefix=0x%03X",
@@ -382,6 +459,66 @@ public:
         next_nibble = next;
     }
 private:
+    void ensure_configuration_() {
+        if (configuration_initialized_) return;
+        pools_[0] = {0x150, 2, -1};
+        pools_[1] = {0x100, 2, -1};
+        pools_[2] = {0x0B0, 4, 7};
+        pools_[3] = {FAN_CMD_FASTER_PREFIX, FAN_CMD_FASTER_STEP, -1};
+        pools_[4] = {FAN_CMD_SLOWER_PREFIX, FAN_CMD_SLOWER_STEP, -1};
+        pools_[5] = {0x160, 2, -1};
+        fans_[0].address = 0x94120;
+        fans_[1].address = 0x64120;
+        const int default_cursors[6] = {0, 1, 3, 6, 0, 5};
+        for (uint8_t fan = 0; fan < FAN_COUNT; fan++) {
+            for (uint8_t pool = 0; pool < 6; pool++)
+                fans_[fan].next_nibble[pool] = default_cursors[pool];
+            fans_[fan].power_state = 0;
+            fans_[fan].speed_state = 0;
+            fans_[fan].light_state = 0;
+        }
+        configuration_initialized_ = true;
+    }
+
+    int find_fan_index_(uint32_t address) const {
+        for (uint8_t i = 0; i < FAN_COUNT; i++)
+            if (fans_[i].address == address) return i;
+        return -1;
+    }
+
+    void send_fixed_command_(uint8_t fan, uint16_t command) {
+        ensure_configuration_();
+        if (fan >= FAN_COUNT) return;
+        send_command(fans_[fan].address, command);
+    }
+
+    void send_pool_command_(uint8_t fan, uint8_t pool) {
+        ensure_configuration_();
+        if (fan >= FAN_COUNT || pool >= 6) return;
+        SequencePool &sequence = pools_[pool];
+        send_cyclic_command(fans_[fan].address, sequence.prefix,
+                            fans_[fan].next_nibble[pool], sequence.step,
+                            sequence.excluded_nibble);
+    }
+
+    void repeat_pool_command_(uint8_t fan, uint8_t pool, uint32_t duration_ms) {
+        ensure_configuration_();
+        if (fan >= FAN_COUNT || pool >= 6) return;
+        SequencePool &sequence = pools_[pool];
+        repeat_cyclic_command_for(fans_[fan].address, sequence.prefix,
+                                  fans_[fan].next_nibble[pool], sequence.step,
+                                  duration_ms, sequence.excluded_nibble);
+    }
+
+    void burst_pool_commands_(uint8_t fan, uint8_t pool, uint8_t count) {
+        ensure_configuration_();
+        if (fan >= FAN_COUNT || pool >= 6) return;
+        SequencePool &sequence = pools_[pool];
+        send_cyclic_burst(fans_[fan].address, sequence.prefix,
+                          fans_[fan].next_nibble[pool], sequence.step, count,
+                          sequence.excluded_nibble);
+    }
+
     bool service_scheduled_transmissions_() {
         if (repeated_send_active_) {
             const uint32_t now = millis();
@@ -419,9 +556,9 @@ private:
 
     void finish_burst_() {
         burst_send_active_ = false;
-        if (burst_final_speed_ >= 1) {
-            fan_power_state_ = 1;
-            fan_speed_state_ = burst_final_speed_;
+        if (burst_final_speed_ >= 1 && burst_fan_index_ < FAN_COUNT) {
+            fans_[burst_fan_index_].power_state = 1;
+            fans_[burst_fan_index_].speed_state = burst_final_speed_;
             state_dirty_ = true;
         }
         burst_final_speed_ = -1;
@@ -478,7 +615,8 @@ private:
 
             const uint32_t address = (message >> 9) & 0xFFFFF;
             const uint16_t command = message & 0x1FF;
-            if (address != 0x94120) {
+            const int fan_index = find_fan_index_(address);
+            if (fan_index < 0) {
                 if (!discovery_mode_ || address == 0 || address == 0xFFFFF) continue;
                 int candidate = 0;
                 while (candidate < discovery_candidate_count &&
@@ -526,14 +664,17 @@ private:
     }
 
     void observe_command_(uint32_t address, uint16_t command, bool received) {
-        if (address != 0x94120) return;
+        const int fan_index = find_fan_index_(address);
+        if (fan_index < 0) return;
+        FanState &fan = fans_[fan_index];
 
-        for (auto &pool : pools_) {
+        for (uint8_t i = 0; i < 6; i++) {
+            const SequencePool &pool = pools_[i];
             if ((command & 0x1F0) != pool.prefix) continue;
             uint8_t next = ((command & 0x0F) + pool.step) & 0x0F;
             if (pool.excluded_nibble >= 0 && next == (pool.excluded_nibble & 0x0F))
                 next = (next + pool.step) & 0x0F;
-            pool.next_nibble = next;
+            fan.next_nibble[i] = next;
         }
 
         last_fan_command_ = command;
@@ -553,31 +694,37 @@ private:
 
         if (command == FAN_CMD_SPEED1 || command == FAN_CMD_SPEED2 || command == FAN_CMD_SPEED3 ||
             command == FAN_CMD_SPEED4 || command == FAN_CMD_SPEED5 || command == FAN_CMD_SPEED6) {
-            fan_power_state_ = 1;
-            if (command == FAN_CMD_SPEED1) fan_speed_state_ = 1;
-            else if (command == FAN_CMD_SPEED2) fan_speed_state_ = 2;
-            else if (command == FAN_CMD_SPEED3) fan_speed_state_ = 3;
-            else if (command == FAN_CMD_SPEED4) fan_speed_state_ = 4;
-            else if (command == FAN_CMD_SPEED5) fan_speed_state_ = 5;
-            else fan_speed_state_ = 6;
+            fan.power_state = 1;
+            if (command == FAN_CMD_SPEED1) fan.speed_state = 1;
+            else if (command == FAN_CMD_SPEED2) fan.speed_state = 2;
+            else if (command == FAN_CMD_SPEED3) fan.speed_state = 3;
+            else if (command == FAN_CMD_SPEED4) fan.speed_state = 4;
+            else if (command == FAN_CMD_SPEED5) fan.speed_state = 5;
+            else fan.speed_state = 6;
         } else if (command == 0x093) {
-            fan_power_state_ = 0;
-            fan_speed_state_ = 0;
+            fan.power_state = 0;
+            fan.speed_state = 0;
         } else if (command == 0x020) {
-            fan_power_state_ = 1;
+            fan.power_state = 1;
+            if (fan.speed_state < 1) fan.speed_state = 1;
         } else if (command == FAN_CMD_TOGGLE) {
-            if (fan_power_state_ >= 0) fan_power_state_ = !fan_power_state_;
+            if (fan.power_state >= 0) {
+                fan.power_state = !fan.power_state;
+                fan.speed_state = fan.power_state ? 1 : 0;
+            }
         } else if ((command & 0x1F0) == FAN_CMD_FASTER_PREFIX) {
-            fan_power_state_ = 1;
-            if (fan_speed_state_ >= 1 && fan_speed_state_ < 6) ++fan_speed_state_;
+            fan.power_state = 1;
+            if (fan.speed_state < 1) fan.speed_state = 1;
+            else if (fan.speed_state < 6) ++fan.speed_state;
         } else if ((command & 0x1F0) == FAN_CMD_SLOWER_PREFIX && command != FAN_CMD_SLOWER_PREFIX) {
-            fan_power_state_ = 1;
-            if (fan_speed_state_ > 1) --fan_speed_state_;
+            fan.power_state = 1;
+            if (fan.speed_state < 1) fan.speed_state = 1;
+            else if (fan.speed_state > 1) --fan.speed_state;
         }
 
         if ((command == FAN_CMD_LIGHT || (command & 0x1F0) == 0x160) &&
-            light_state_ >= 0)
-            light_state_ = !light_state_;
+            fan.light_state >= 0)
+            fan.light_state = !fan.light_state;
     }
 };
 

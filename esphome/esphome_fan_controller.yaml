@@ -6,7 +6,7 @@
 # Wiring (ESP32 → CC1101 module):
 #   GPIO 18 → SCK        GPIO 5  → CSN
 #   GPIO 19 → MISO       GPIO 25 → GDO0 (TX data)
-#   GPIO 23 → MOSI       GPIO 26 → GDO2 (continuous RX)
+#   GPIO 23 → MOSI       GPIO 26 → GDO2 (RX, unused here)
 #
 # To change pins, edit the #defines in cc1101_fan_controller.h
 # or override via build_flags below.
@@ -21,51 +21,9 @@ esphome:
     - SPI
     - CC1101-ESP-Arduino=https://github.com/jacekplonka/CC1101-ESP-Arduino.git
   on_boot:
-    priority: -100
+    priority: 600
     then:
-      - lambda: |-
-          fan_ctrl.restore_state(
-            id(dimmer_nibble), id(brighter_nibble), id(color_temperature_nibble),
-            id(fan_faster_cursor_v2), id(slower_nibble), id(light_on_nibble),
-            id(dimmer_nibble_2), id(brighter_nibble_2), id(color_temperature_nibble_2),
-            id(fan_2_faster_cursor_v2), id(slower_nibble_2), id(fan_2_light_cursor_v2),
-            id(last_remote_address), id(last_remote_command), id(last_fan_command),
-            id(discovered_fan_address),
-            id(fan_power_state_v2), id(fan_speed_state_v2), id(light_state_v2),
-            id(fan_2_power_state_v2), id(fan_2_speed_state_v2), id(fan_2_light_state_v2));
-          fan_ctrl.begin();
-          id(fan_state_sync) = true;
-          id(my_fan).state = fan_ctrl.fan_power_state(0) > 0;
-          id(my_fan).speed = id(my_fan).state ? fan_ctrl.fan_speed_state(0) : 0;
-          id(my_fan).publish_state();
-          id(fan_64120).state = fan_ctrl.fan_power_state(1) > 0;
-          id(fan_64120).speed = id(fan_64120).state ? fan_ctrl.fan_speed_state(1) : 0;
-          id(fan_64120).publish_state();
-          id(fan_state_sync) = false;
-
-          if (fan_ctrl.last_remote_command() < 0) {
-            id(last_remote_command_text).publish_state("No remote command seen");
-          } else {
-            char value[32];
-            snprintf(value, sizeof(value), "0x%05X / 0x%03X",
-                     (unsigned int)fan_ctrl.last_remote_address(),
-                     (unsigned int)fan_ctrl.last_remote_command());
-            id(last_remote_command_text).publish_state(value);
-          }
-          if (fan_ctrl.last_fan_command() < 0) {
-            id(last_fan_command_text).publish_state("No command sent or received");
-          } else {
-            char value[16];
-            snprintf(value, sizeof(value), "0x%03X", (unsigned int)fan_ctrl.last_fan_command());
-            id(last_fan_command_text).publish_state(value);
-          }
-          if (fan_ctrl.discovered_address() < 0) {
-            id(discovered_fan_address_text).publish_state("No address found");
-          } else {
-            char value[16];
-            snprintf(value, sizeof(value), "0x%05X", (unsigned int)fan_ctrl.discovered_address());
-            id(discovered_fan_address_text).publish_state(value);
-          }
+      - lambda: 'fan_ctrl.begin();'
 
 esp32:
   board: esp32dev
@@ -185,20 +143,23 @@ text_sensor:
   - platform: template
     id: last_remote_command_text
     name: "Fan Controller Last Remote Command"
+    entity_category: diagnostic
     update_interval: never
   - platform: template
     id: last_fan_command_text
     name: "Fan Controller Last Command Code"
+    entity_category: diagnostic
     update_interval: never
   - platform: template
     id: discovered_fan_address_text
     name: "Discovered Fan Address"
+    entity_category: diagnostic
     update_interval: never
 
 fan:
   - platform: template
     id: my_fan
-    name: "My Fan"
+    name: "Office Fan"
     speed_count: 6
     restore_mode: NO_RESTORE
     on_turn_on:
@@ -209,7 +170,7 @@ fan:
       - lambda: 'if (!id(fan_state_sync)) fan_ctrl.fan_set_speed(0, x);'
   - platform: template
     id: fan_64120
-    name: "Fan 0x64120"
+    name: "Bedroom Fan"
     speed_count: 6
     restore_mode: NO_RESTORE
     on_turn_on:
@@ -221,15 +182,13 @@ fan:
 
 binary_sensor:
   - platform: template
-    name: "My Fan Light State"
+    name: "Office Fan Light State"
     device_class: light
-    update_interval: 1s
     lambda: |-
       return fan_ctrl.light_state(0) > 0;
   - platform: template
-    name: "Fan 0x64120 Light State"
+    name: "Bedroom Fan Light State"
     device_class: light
-    update_interval: 1s
     lambda: |-
       return fan_ctrl.light_state(1) > 0;
 
@@ -238,6 +197,7 @@ binary_sensor:
 switch:
   - platform: template
     name: "Fan Address Discovery"
+    entity_category: diagnostic
     lambda: 'return fan_ctrl.discovery_mode();'
     turn_on_action:
       - lambda: 'fan_ctrl.set_discovery_mode(true);'
@@ -355,139 +315,72 @@ globals:
 # HA entity definitions. RF codes and per-fan sequence logic live in the C++ controller.
 button:
   - platform: template
-    name: "My Fan - On"
-    icon: "mdi:power"
-    on_press:
-      - lambda: 'fan_ctrl.fan_on(0);'
-  - platform: template
-    name: "My Fan - Off"
-    icon: "mdi:power-off"
-    on_press:
-      - lambda: 'fan_ctrl.fan_off(0);'
-  - platform: template
-    name: "My Fan - Light Toggle"
+    name: "Office Fan - Light Toggle"
     icon: "mdi:lightbulb-on"
     on_press:
       - lambda: 'fan_ctrl.fan_light_toggle(0);'
   - platform: template
-    name: "My Fan - Light Color Temperature"
+    name: "Office Fan - Light Color Temperature"
     icon: "mdi:thermometer"
     on_press:
       - lambda: 'fan_ctrl.fan_color_temperature(0);'
   - platform: template
-    name: "My Fan - Direction"
+    name: "Office Fan - Direction"
     icon: "mdi:swap-vertical"
     on_press:
       - lambda: 'fan_ctrl.fan_direction_toggle(0);'
   - platform: template
-    name: "My Fan - Dimmer"
+    name: "Office Fan - Dimmer"
     icon: "mdi:brightness-6"
     on_press:
       - lambda: 'fan_ctrl.fan_dimmer(0);'
   - platform: template
-    name: "My Fan - Brighter"
+    name: "Office Fan - Brighter"
     icon: "mdi:brightness-7"
     on_press:
       - lambda: 'fan_ctrl.fan_brighter(0);'
   - platform: template
-    name: "My Fan - Max Brightness (7s)"
+    name: "Office Fan - Max Brightness (7s)"
     icon: "mdi:brightness-7"
     on_press:
       - lambda: 'fan_ctrl.fan_max_brightness(0);'
   - platform: template
-    name: "My Fan - Min Brightness (7s)"
+    name: "Office Fan - Min Brightness (7s)"
     icon: "mdi:brightness-5"
     on_press:
       - lambda: 'fan_ctrl.fan_min_brightness(0);'
   - platform: template
-    name: "My Fan - Faster"
-    icon: "mdi:fan-plus"
-    on_press:
-      - lambda: 'fan_ctrl.fan_speed_up(0);'
-  - platform: template
-    name: "My Fan - Slower"
-    icon: "mdi:fan-minus"
-    on_press:
-      - lambda: 'fan_ctrl.fan_speed_down(0);'
-  - platform: template
-    name: "My Fan - Max Speed"
-    icon: "mdi:fan-chevron-up"
-    on_press:
-      - lambda: 'fan_ctrl.fan_max_speed(0);'
-  - platform: template
-    name: "My Fan - Min Speed"
-    icon: "mdi:fan-chevron-down"
-    on_press:
-      - lambda: 'fan_ctrl.fan_min_speed(0);'
-
-  - platform: template
-    name: "Fan 0x64120 - On"
-    icon: "mdi:power"
-    on_press:
-      - lambda: 'fan_ctrl.fan_on(1);'
-  - platform: template
-    name: "Fan 0x64120 - Off"
-    icon: "mdi:power-off"
-    on_press:
-      - lambda: 'fan_ctrl.fan_off(1);'
-  - platform: template
-    name: "Fan 0x64120 - Light Toggle"
+    name: "Bedroom Fan - Light Toggle"
     icon: "mdi:lightbulb-on"
     on_press:
       - lambda: 'fan_ctrl.fan_light_toggle(1);'
   - platform: template
-    name: "Fan 0x64120 - Light Color Temperature"
+    name: "Bedroom Fan - Light Color Temperature"
     icon: "mdi:thermometer"
     on_press:
       - lambda: 'fan_ctrl.fan_color_temperature(1);'
   - platform: template
-    name: "Fan 0x64120 - Direction"
+    name: "Bedroom Fan - Direction"
     icon: "mdi:swap-vertical"
     on_press:
       - lambda: 'fan_ctrl.fan_direction_toggle(1);'
   - platform: template
-    name: "Fan 0x64120 - Dimmer"
+    name: "Bedroom Fan - Dimmer"
     icon: "mdi:brightness-6"
     on_press:
       - lambda: 'fan_ctrl.fan_dimmer(1);'
   - platform: template
-    name: "Fan 0x64120 - Brighter"
+    name: "Bedroom Fan - Brighter"
     icon: "mdi:brightness-7"
     on_press:
       - lambda: 'fan_ctrl.fan_brighter(1);'
   - platform: template
-    name: "Fan 0x64120 - Max Brightness (7s)"
+    name: "Bedroom Fan - Max Brightness (7s)"
     icon: "mdi:brightness-7"
     on_press:
       - lambda: 'fan_ctrl.fan_max_brightness(1);'
   - platform: template
-    name: "Fan 0x64120 - Min Brightness (7s)"
+    name: "Bedroom Fan - Min Brightness (7s)"
     icon: "mdi:brightness-5"
     on_press:
       - lambda: 'fan_ctrl.fan_min_brightness(1);'
-  - platform: template
-    name: "Fan 0x64120 - Faster"
-    icon: "mdi:fan-plus"
-    on_press:
-      - lambda: 'fan_ctrl.fan_speed_up(1);'
-  - platform: template
-    name: "Fan 0x64120 - Slower"
-    icon: "mdi:fan-minus"
-    on_press:
-      - lambda: 'fan_ctrl.fan_speed_down(1);'
-  - platform: template
-    name: "Fan 0x64120 - Max Speed"
-    icon: "mdi:fan-chevron-up"
-    on_press:
-      - lambda: 'fan_ctrl.fan_max_speed(1);'
-  - platform: template
-    name: "Fan 0x64120 - Min Speed"
-    icon: "mdi:fan-chevron-down"
-    on_press:
-      - lambda: 'fan_ctrl.fan_min_speed(1);'
-
-  - platform: template
-    name: "Log Next RF Command"
-    icon: "mdi:radio-tower"
-    on_press:
-      - lambda: 'fan_ctrl.record_signal();'

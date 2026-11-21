@@ -1,6 +1,7 @@
 #pragma once
 #include "esphome.h"
 #include <CC1101_ESP_Arduino.h>
+#include <initializer_list>
 
 // ============================================================
 // Fan RF Protocol Constants
@@ -56,7 +57,7 @@ static const int OOK_MSG_BITS = 29;  // 20-bit address + 9-bit command
 #endif
 
 // Forward declaration for ISR
-static void IRAM_ATTR rf_record_isr();
+static void rf_record_isr();
 
 class CC1101FanController {
     static constexpr uint8_t FAN_COUNT = 2;
@@ -82,6 +83,18 @@ class CC1101FanController {
         int speed_state;
         int light_state;
     } fans_[FAN_COUNT] = {};
+
+    esphome::fan::Fan *fan_entities_[FAN_COUNT] = {};
+    esphome::binary_sensor::BinarySensor *light_entities_[FAN_COUNT] = {};
+    esphome::text_sensor::TextSensor *last_remote_text_ = nullptr;
+    esphome::text_sensor::TextSensor *last_command_text_ = nullptr;
+    esphome::text_sensor::TextSensor *discovered_address_text_ = nullptr;
+    esphome::switch_::Switch *discovery_switch_ = nullptr;
+    static constexpr size_t PERSISTED_VALUE_COUNT = 22;
+    int *persisted_values_[PERSISTED_VALUE_COUNT] = {};
+    bool persisted_values_bound_ = false;
+    bool syncing_fan_state_ = false;
+    bool syncing_discovery_switch_ = false;
 
     int last_remote_address_ = -1;
     int last_remote_command_ = -1;
@@ -122,8 +135,70 @@ public:
         ensure_configuration_();
     }
 
-    // Load ESPHome's restored globals into local state. The main YAML lambda
-    // copies updates back into those globals after loop() processes a frame.
+    void bind_entities(esphome::fan::Fan *fan_1, esphome::fan::Fan *fan_2,
+                       esphome::binary_sensor::BinarySensor *light_1,
+                       esphome::binary_sensor::BinarySensor *light_2,
+                       esphome::text_sensor::TextSensor *last_remote_text,
+                       esphome::text_sensor::TextSensor *last_command_text,
+                       esphome::text_sensor::TextSensor *discovered_address_text,
+                       esphome::switch_::Switch *discovery_switch) {
+        fan_entities_[0] = fan_1;
+        fan_entities_[1] = fan_2;
+        for (uint8_t fan = 0; fan < FAN_COUNT; fan++) {
+            if (fan_entities_[fan] != nullptr) {
+                fan_entities_[fan]->add_on_state_callback([this, fan]() {
+                    this->handle_fan_entity_state_(fan);
+                });
+            }
+        }
+        light_entities_[0] = light_1;
+        light_entities_[1] = light_2;
+        last_remote_text_ = last_remote_text;
+        last_command_text_ = last_command_text;
+        discovered_address_text_ = discovered_address_text;
+        discovery_switch_ = discovery_switch;
+        if (discovery_switch_ != nullptr) {
+            discovery_switch_->add_on_state_callback([this](bool state) {
+                if (!this->syncing_discovery_switch_) this->set_discovery_mode(state);
+            });
+        }
+        state_dirty_ = true;
+    }
+
+    void bind_buttons(std::initializer_list<esphome::button::Button *> fan_1_buttons,
+                      std::initializer_list<esphome::button::Button *> fan_2_buttons) {
+        if (fan_1_buttons.size() != 7 || fan_2_buttons.size() != 7)
+            ESP_LOGE("cc1101", "Each fan must have seven button entities in the configured action order");
+        bind_button_group_(fan_1_buttons, 0);
+        bind_button_group_(fan_2_buttons, 1);
+    }
+
+    // Keep the YAML globals as ESPHome's persistent storage, while handling
+    // their restore and update entirely inside this controller.
+    void bind_persistent_values(std::initializer_list<int *> values) {
+        if (values.size() != PERSISTED_VALUE_COUNT) {
+            ESP_LOGE("cc1101", "Expected %u persistent state values, received %u",
+                     (unsigned)PERSISTED_VALUE_COUNT, (unsigned)values.size());
+            return;
+        }
+        size_t index = 0;
+        for (int *value : values) persisted_values_[index++] = value;
+
+        restore_state(
+            *persisted_values_[0], *persisted_values_[1], *persisted_values_[2],
+            *persisted_values_[3], *persisted_values_[4], *persisted_values_[5],
+            *persisted_values_[6], *persisted_values_[7], *persisted_values_[8],
+            *persisted_values_[9], *persisted_values_[10], *persisted_values_[11],
+            *persisted_values_[12], *persisted_values_[13], *persisted_values_[14],
+            *persisted_values_[15], *persisted_values_[16], *persisted_values_[17],
+            *persisted_values_[18], *persisted_values_[19], *persisted_values_[20],
+            *persisted_values_[21]);
+        persisted_values_bound_ = true;
+        state_dirty_ = true;
+    }
+
+    // Load ESPHome's restored globals into local state. The controller also
+    // writes changes back when it publishes an updated fan state.
     void restore_state(int dimmer, int brighter, int color_temperature,
                        int faster, int slower, int light_toggle,
                        int dimmer_2, int brighter_2, int color_temperature_2,
@@ -166,26 +241,9 @@ public:
         state_dirty_ = false;
     }
 
-    bool consume_state_update() {
-        if (!state_dirty_) return false;
-        state_dirty_ = false;
-        return true;
-    }
-    int sequence_cursor(uint8_t fan, uint8_t pool) const {
-        return fan < FAN_COUNT && pool < 6 ? fans_[fan].next_nibble[pool] : 0;
-    }
-    int last_remote_address() const { return last_remote_address_; }
-    int last_remote_command() const { return last_remote_command_; }
-    int last_fan_command() const { return last_fan_command_; }
-    int discovered_address() const { return discovered_address_; }
-    bool discovery_mode() const { return discovery_mode_; }
-    int fan_power_state(uint8_t fan) const { return fan < FAN_COUNT ? fans_[fan].power_state : -1; }
-    int fan_speed_state(uint8_t fan) const { return fan < FAN_COUNT ? fans_[fan].speed_state : -1; }
-    int light_state(uint8_t fan) const { return fan < FAN_COUNT ? fans_[fan].light_state : -1; }
-    uint32_t fan_address(uint8_t fan) const { return fan < FAN_COUNT ? fans_[fan].address : 0; }
-
     void set_discovery_mode(bool enabled) {
         discovery_mode_ = enabled;
+        state_dirty_ = true;
         ESP_LOGI("cc1101_discovery", enabled ? "address discovery enabled" : "address discovery disabled");
     }
 
@@ -254,8 +312,12 @@ public:
     // repeated RF transmission, then the captured frames are decoded before
     // the receiver is armed for the next one.
     void loop() {
+        publish_state_updates_();
         if (!ready_ || !listening_) return;
-        if (service_scheduled_transmissions_()) return;
+        if (service_scheduled_transmissions_()) {
+            publish_state_updates_();
+            return;
+        }
 
         const int count = rec_count_;
         if (count <= 0) return;
@@ -277,6 +339,7 @@ public:
         const int captured = rec_count_;
         if (captured >= MIN_CAPTURE_EDGES) process_received_signal_(captured);
         start_listening_();
+        publish_state_updates_();
     }
 
     // Keep the existing diagnostic button useful without interrupting the
@@ -364,7 +427,9 @@ public:
 
         digitalWrite(gdo0_, LOW);
         radio_.setIdle();
-        if (!quiet) ESP_LOGD("cc1101", "TX  addr=0x%05X  cmd=0x%03X", address, command);
+        if (!quiet)
+            ESP_LOGD("cc1101", "TX  addr=0x%05lX  cmd=0x%03X",
+                     (unsigned long)address, (unsigned int)command);
         observe_command_(address, command, false);
         start_listening_();
     }
@@ -459,6 +524,129 @@ public:
         next_nibble = next;
     }
 private:
+    void bind_button_group_(std::initializer_list<esphome::button::Button *> buttons,
+                            uint8_t fan) {
+        uint8_t action = 0;
+        for (esphome::button::Button *button : buttons) {
+            if (action >= 7) break;
+            const uint8_t action_index = action++;
+            if (button == nullptr) continue;
+            button->add_on_press_callback([this, fan, action_index]() {
+                this->execute_button_(fan, action_index);
+            });
+        }
+    }
+
+    void execute_button_(uint8_t fan, uint8_t action) {
+        switch (action) {
+            case 0: fan_light_toggle(fan); break;
+            case 1: fan_color_temperature(fan); break;
+            case 2: fan_direction_toggle(fan); break;
+            case 3: fan_dimmer(fan); break;
+            case 4: fan_brighter(fan); break;
+            case 5: fan_max_brightness(fan); break;
+            case 6: fan_min_brightness(fan); break;
+        }
+    }
+
+    void handle_fan_entity_state_(uint8_t fan) {
+        if (syncing_fan_state_ || fan >= FAN_COUNT || fan_entities_[fan] == nullptr) return;
+        esphome::fan::Fan *entity = fan_entities_[fan];
+        if (!entity->state) {
+            if (fans_[fan].power_state > 0) fan_off(fan);
+            return;
+        }
+
+        if (fans_[fan].power_state <= 0) fan_on(fan);
+        const int requested_speed = entity->speed;
+        if (requested_speed >= 1 && requested_speed != fans_[fan].speed_state)
+            fan_set_speed(fan, requested_speed);
+    }
+
+    void save_persisted_values_() {
+        if (!persisted_values_bound_) return;
+        size_t index = 0;
+        for (uint8_t fan = 0; fan < FAN_COUNT; fan++)
+            for (uint8_t pool = 0; pool < 6; pool++)
+                *persisted_values_[index++] = fans_[fan].next_nibble[pool];
+        *persisted_values_[index++] = last_remote_address_;
+        *persisted_values_[index++] = last_remote_command_;
+        *persisted_values_[index++] = last_fan_command_;
+        *persisted_values_[index++] = discovered_address_;
+        for (uint8_t fan = 0; fan < FAN_COUNT; fan++) {
+            *persisted_values_[index++] = fans_[fan].power_state;
+            *persisted_values_[index++] = fans_[fan].speed_state;
+            *persisted_values_[index++] = fans_[fan].light_state;
+        }
+    }
+
+    void publish_state_updates_() {
+        if (!state_dirty_) return;
+        state_dirty_ = false;
+        save_persisted_values_();
+
+        for (uint8_t fan = 0; fan < FAN_COUNT; fan++) {
+            const bool fan_on = fans_[fan].power_state > 0;
+            const int speed = fan_on ? fans_[fan].speed_state : 0;
+            esphome::fan::Fan *entity = fan_entities_[fan];
+            if (entity != nullptr &&
+                (!entity->has_state() || entity->state != fan_on || entity->speed != speed)) {
+                syncing_fan_state_ = true;
+                entity->state = fan_on;
+                entity->speed = speed;
+                entity->publish_state();
+                syncing_fan_state_ = false;
+            }
+
+            esphome::binary_sensor::BinarySensor *light = light_entities_[fan];
+            const bool light_on = fans_[fan].light_state > 0;
+            if (light != nullptr && (!light->has_state() || light->state != light_on))
+                light->publish_state(light_on);
+        }
+
+        if (last_remote_text_ != nullptr) {
+            char value[32];
+            if (last_remote_command_ < 0) {
+                snprintf(value, sizeof(value), "No remote command seen");
+            } else {
+                snprintf(value, sizeof(value), "0x%05X / 0x%03X",
+                         (unsigned int)last_remote_address_,
+                         (unsigned int)last_remote_command_);
+            }
+            if (!last_remote_text_->has_state() || last_remote_text_->get_state() != value)
+                last_remote_text_->publish_state(value);
+        }
+
+        if (last_command_text_ != nullptr) {
+            char value[32];
+            if (last_fan_command_ < 0) {
+                snprintf(value, sizeof(value), "No command sent or received");
+            } else {
+                snprintf(value, sizeof(value), "0x%03X", (unsigned int)last_fan_command_);
+            }
+            if (!last_command_text_->has_state() || last_command_text_->get_state() != value)
+                last_command_text_->publish_state(value);
+        }
+
+        if (discovered_address_text_ != nullptr) {
+            char value[16];
+            if (discovered_address_ < 0) {
+                snprintf(value, sizeof(value), "No address found");
+            } else {
+                snprintf(value, sizeof(value), "0x%05X", (unsigned int)discovered_address_);
+            }
+            if (!discovered_address_text_->has_state() || discovered_address_text_->get_state() != value)
+                discovered_address_text_->publish_state(value);
+        }
+
+        if (discovery_switch_ != nullptr &&
+            (!discovery_switch_->has_state() || discovery_switch_->state != discovery_mode_)) {
+            syncing_discovery_switch_ = true;
+            discovery_switch_->publish_state(discovery_mode_);
+            syncing_discovery_switch_ = false;
+        }
+    }
+
     void ensure_configuration_() {
         if (configuration_initialized_) return;
         pools_[0] = {0x150, 2, -1};

@@ -15,6 +15,10 @@ static const uint16_t FAN_CMD_SPEED6 = 0x14A;  // 101001010
 static const uint16_t FAN_CMD_TOGGLE = 0x191;  // 110010001
 static const uint16_t FAN_CMD_LIGHT  = 0x0B5;  // 010110101
 static const uint16_t FAN_CMD_INVERT = 0x12B;  // 100101011
+static const uint16_t FAN_CMD_FASTER_PREFIX = 0x0C0;
+static const uint8_t FAN_CMD_FASTER_STEP = 2;
+static const uint16_t FAN_CMD_SLOWER_PREFIX = 0x020;
+static const uint8_t FAN_CMD_SLOWER_STEP = 2;
 
 // OOK timings (microseconds), estimated from the recorded 0x093 frames.
 // Receiver captures show asymmetric mark/space intervals, so keep each
@@ -59,10 +63,45 @@ class CC1101FanController {
     int gdo0_;
     int gdo2_;
     bool ready_ = false;
+    bool listening_ = false;
+    bool log_next_capture_ = false;
     portMUX_TYPE rf_mux_ = portMUX_INITIALIZER_UNLOCKED;
+
+    struct SequencePool {
+        uint16_t prefix;
+        uint8_t step;
+        int excluded_nibble;
+        int next_nibble;
+    } pools_[6] = {};
+
+    int last_remote_address_ = -1;
+    int last_remote_command_ = -1;
+    int last_fan_command_ = -1;
+    int discovered_address_ = -1;
+    int fan_power_state_ = -1;
+    int fan_speed_state_ = -1;
+    int light_state_ = -1;
+    bool state_dirty_ = false;
+    bool discovery_mode_ = false;
+    bool repeated_send_active_ = false;
+    uint32_t repeated_send_address_ = 0;
+    uint16_t repeated_send_command_ = 0;
+    uint32_t repeated_send_until_ms_ = 0;
+    uint32_t repeated_send_next_ms_ = 0;
+    static constexpr uint8_t MAX_BURST_COMMANDS = 8;
+    bool burst_send_active_ = false;
+    uint32_t burst_send_address_ = 0;
+    uint16_t burst_commands_[MAX_BURST_COMMANDS] = {};
+    uint8_t burst_command_count_ = 0;
+    uint8_t burst_command_index_ = 0;
+    uint32_t burst_send_next_ms_ = 0;
+    int burst_final_speed_ = -1;
+    uint32_t last_observed_message_ = 0;
+    uint32_t last_observed_ms_ = 0;
 
 public:
     static constexpr int MAX_CHANGES = 512;
+    static constexpr int MIN_CAPTURE_EDGES = 55;
     static volatile int rec_timings_[MAX_CHANGES];
     static volatile int rec_levels_[MAX_CHANGES];
     static volatile int rec_initial_level_;
@@ -73,6 +112,49 @@ public:
 
     CC1101FanController(int sck, int miso, int mosi, int cs, int gdo0, int gdo2)
         : radio_(sck, miso, mosi, cs, gdo0, gdo2), gdo0_(gdo0), gdo2_(gdo2) {}
+
+    // Load ESPHome's restored globals into local state. The main YAML lambda
+    // copies updates back into those globals after loop() processes a frame.
+    void restore_state(int dimmer, int brighter, int color_temperature,
+                       int faster, int slower, int light_toggle,
+                       int last_address, int last_command, int last_fan_command,
+                       int discovered_address,
+                       int fan_power, int fan_speed, int light) {
+        pools_[0] = {0x150, 2, -1, dimmer};
+        pools_[1] = {0x100, 2, -1, brighter};
+        pools_[2] = {0x0B0, 4, 7, color_temperature};
+        pools_[3] = {FAN_CMD_FASTER_PREFIX, FAN_CMD_FASTER_STEP, -1, faster};
+        pools_[4] = {FAN_CMD_SLOWER_PREFIX, FAN_CMD_SLOWER_STEP, -1, slower};
+        pools_[5] = {0x160, 2, -1, light_toggle};
+        last_remote_address_ = last_address;
+        last_remote_command_ = last_command;
+        last_fan_command_ = last_fan_command;
+        discovered_address_ = discovered_address;
+        fan_power_state_ = fan_power;
+        fan_speed_state_ = fan_speed;
+        light_state_ = light;
+        state_dirty_ = false;
+    }
+
+    bool consume_state_update() {
+        if (!state_dirty_) return false;
+        state_dirty_ = false;
+        return true;
+    }
+    int sequence_cursor(uint8_t pool) const { return pool < 6 ? pools_[pool].next_nibble : 0; }
+    int last_remote_address() const { return last_remote_address_; }
+    int last_remote_command() const { return last_remote_command_; }
+    int last_fan_command() const { return last_fan_command_; }
+    int discovered_address() const { return discovered_address_; }
+    bool discovery_mode() const { return discovery_mode_; }
+    int fan_power_state() const { return fan_power_state_; }
+    int fan_speed_state() const { return fan_speed_state_; }
+    int light_state() const { return light_state_; }
+
+    void set_discovery_mode(bool enabled) {
+        discovery_mode_ = enabled;
+        ESP_LOGI("cc1101_discovery", enabled ? "address discovery enabled" : "address discovery disabled");
+    }
 
     bool begin() {
         radio_.init();
@@ -92,10 +174,52 @@ public:
 
         ready_ = true;
         ESP_LOGI("cc1101", "CC1101 OK  part=0x%02X  ver=0x%02X  433.92 MHz ASK/OOK", partnum, version);
+        start_listening_();
+        ESP_LOGI("cc1101", "Continuous RX listening for fan address 0x94120");
         return true;
     }
 
-    void send_command(uint32_t address, uint16_t command, bool odd_parity = false) {
+    // Call regularly from an ESPHome interval. A quiet period closes each
+    // repeated RF transmission, then the captured frames are decoded before
+    // the receiver is armed for the next one.
+    void loop() {
+        if (!ready_ || !listening_) return;
+        if (service_scheduled_transmissions_()) return;
+
+        const int count = rec_count_;
+        if (count <= 0) return;
+        const uint32_t now = (uint32_t)micros();
+        const uint32_t last = (uint32_t)rec_last_us_;
+        const bool full = count >= MAX_CHANGES - 2;
+        if (!full && (uint32_t)(now - last) < 25000U) return;
+
+        // The CC1101 OOK output can chatter between packets. Discard short
+        // noise bursts in place instead of restarting the receiver for each.
+        if (!full && count < MIN_CAPTURE_EDGES) {
+            rec_count_ = 0;
+            rec_signal_detected_ = false;
+            rec_last_us_ = now;
+            return;
+        }
+
+        stop_listening_();
+        const int captured = rec_count_;
+        if (captured >= MIN_CAPTURE_EDGES) process_received_signal_(captured);
+        start_listening_();
+    }
+
+    // Keep the existing diagnostic button useful without interrupting the
+    // permanent listener or blocking the ESPHome main loop.
+    void record_signal() {
+        log_next_capture_ = true;
+        ESP_LOGI("cc1101", "Continuous RX is active; the next received transmission will be logged.");
+    }
+
+    void send_command(uint32_t address, uint16_t command, bool odd_parity = false, bool quiet = false) {
+        if (!quiet) {
+            repeated_send_active_ = false;
+            burst_send_active_ = false;
+        }
         if (!ready_) {
             ESP_LOGW("cc1101", "Not initialised — skipping TX");
             return;
@@ -114,11 +238,14 @@ public:
         tx_bits[31] = '0';
         tx_bits[32] = parity ? '1' : '0';
         tx_bits[33] = '\0';
-        ESP_LOGI("cc1101_tx", "addr=0x%05lX cmd=0x%03X frame33=%s parity=%s reps=%d gap=%dus",
-                 (unsigned long)address, command, tx_bits, odd_parity ? "odd" : "even", OOK_TX_REPS, OOK_GAP_US);
-        ESP_LOGI("cc1101_tx", "TX timing: bit1 mark/space=%d/%dus; bit0=%d/%dus",
-                 OOK_MARK_1_US, OOK_SPACE_1_US, OOK_MARK_0_US, OOK_SPACE_0_US);
+        if (!quiet) {
+            ESP_LOGI("cc1101_tx", "addr=0x%05lX cmd=0x%03X frame33=%s parity=%s reps=%d gap=%dus",
+                     (unsigned long)address, command, tx_bits, odd_parity ? "odd" : "even", OOK_TX_REPS, OOK_GAP_US);
+            ESP_LOGI("cc1101_tx", "TX timing: bit1 mark/space=%d/%dus; bit0=%d/%dus",
+                     OOK_MARK_1_US, OOK_SPACE_1_US, OOK_MARK_0_US, OOK_SPACE_0_US);
+        }
 
+        stop_listening_();
         radio_.setTx();
         pinMode(gdo0_, OUTPUT);
         delayMicroseconds(500);
@@ -161,7 +288,80 @@ public:
 
         digitalWrite(gdo0_, LOW);
         radio_.setIdle();
-        ESP_LOGD("cc1101", "TX  addr=0x%05X  cmd=0x%03X", address, command);
+        if (!quiet) ESP_LOGD("cc1101", "TX  addr=0x%05X  cmd=0x%03X", address, command);
+        observe_command_(address, command, false);
+        start_listening_();
+    }
+
+    // Reuse one code for the whole hold, while advancing the pool cursor only
+    // once when that code is first transmitted.
+    void repeat_cyclic_command_for(uint32_t address, uint16_t command_prefix,
+                                   int &next_nibble, uint8_t step,
+                                   uint32_t duration_ms, int excluded_nibble = -1) {
+        if (!ready_) {
+            ESP_LOGW("cc1101", "Not initialised — skipping repeated TX");
+            return;
+        }
+        uint8_t nibble = next_nibble & 0x0F;
+        if (excluded_nibble >= 0 && nibble == (excluded_nibble & 0x0F))
+            nibble = (nibble + step) & 0x0F;
+        const uint16_t command = (command_prefix & 0x1F0) | nibble;
+        ESP_LOGI("cc1101_seq", "holding addr=0x%05lX cmd=0x%03X for %lu ms",
+                 (unsigned long)address, command, (unsigned long)duration_ms);
+
+        repeated_send_active_ = true;
+        burst_send_active_ = false;
+        repeated_send_address_ = address;
+        repeated_send_command_ = command;
+        send_command(address, command, false, true);
+        repeated_send_until_ms_ = millis() + duration_ms;
+        repeated_send_next_ms_ = millis() + 150U;
+    }
+
+    // Send a short run of distinct codes from one command pool. Each code is
+    // transmitted once as a three-frame RF packet; duplicate pool values are
+    // rejected before the burst starts.
+    void send_cyclic_burst(uint32_t address, uint16_t command_prefix,
+                           int &next_nibble, uint8_t step, uint8_t command_count,
+                           int excluded_nibble = -1) {
+        if (!ready_) {
+            ESP_LOGW("cc1101", "Not initialised — skipping command burst");
+            return;
+        }
+        if (command_count == 0 || command_count > MAX_BURST_COMMANDS) {
+            ESP_LOGW("cc1101", "Invalid burst length: %u", command_count);
+            return;
+        }
+
+        uint8_t nibble = next_nibble & 0x0F;
+        burst_command_count_ = 0;
+        for (uint8_t i = 0; i < command_count; i++) {
+            if (excluded_nibble >= 0 && nibble == (excluded_nibble & 0x0F))
+                nibble = (nibble + step) & 0x0F;
+            const uint16_t command = (command_prefix & 0x1F0) | nibble;
+            bool duplicate = false;
+            for (uint8_t previous = 0; previous < burst_command_count_; previous++)
+                if (burst_commands_[previous] == command) duplicate = true;
+            if (duplicate) break;
+            burst_commands_[burst_command_count_++] = command;
+            nibble = (nibble + step) & 0x0F;
+        }
+        if (burst_command_count_ == 0) {
+            ESP_LOGW("cc1101", "Command pool produced no distinct codes");
+            return;
+        }
+        if (burst_command_count_ != command_count)
+            ESP_LOGW("cc1101", "Pool has only %u distinct codes; sending that many", burst_command_count_);
+
+        repeated_send_active_ = false;
+        burst_send_active_ = true;
+        burst_send_address_ = address;
+        burst_command_index_ = 0;
+        burst_final_speed_ = command_prefix == FAN_CMD_FASTER_PREFIX ? 6 :
+                             command_prefix == FAN_CMD_SLOWER_PREFIX ? 1 : -1;
+        ESP_LOGI("cc1101_seq", "sending %u distinct codes from prefix=0x%03X",
+                 burst_command_count_, command_prefix);
+        send_next_burst_command_();
     }
 
     void send_cyclic_command(uint32_t address, uint16_t command_prefix, int &next_nibble, uint8_t step, int excluded_nibble = -1) {
@@ -181,115 +381,82 @@ public:
             next = (next + step) & 0x0F;
         next_nibble = next;
     }
-    void record_signal() {
-        if (!ready_) {
-            ESP_LOGW("cc1101", "Not initialised — skipping RX record");
+private:
+    bool service_scheduled_transmissions_() {
+        if (repeated_send_active_) {
+            const uint32_t now = millis();
+            if ((int32_t)(now - repeated_send_until_ms_) >= 0) {
+                repeated_send_active_ = false;
+                ESP_LOGI("cc1101_seq", "timed command complete");
+                return true;
+            }
+            if ((int32_t)(now - repeated_send_next_ms_) >= 0) {
+                send_command(repeated_send_address_, repeated_send_command_, false, true);
+                repeated_send_next_ms_ = millis() + 150U;
+                return true;
+            }
+        }
+        if (burst_send_active_ && (int32_t)(millis() - burst_send_next_ms_) >= 0) {
+            send_next_burst_command_();
+            return true;
+        }
+        return false;
+    }
+
+    void send_next_burst_command_() {
+        if (burst_command_index_ >= burst_command_count_) {
+            finish_burst_();
             return;
         }
+        const uint16_t command = burst_commands_[burst_command_index_++];
+        send_command(burst_send_address_, command, false, true);
+        if (burst_command_index_ >= burst_command_count_) {
+            finish_burst_();
+        } else {
+            burst_send_next_ms_ = millis() + 150U;
+        }
+    }
 
-        ESP_LOGI("cc1101", "=== RECORDING: Put CC1101 in RX, waiting for signal (10s timeout) ===");
+    void finish_burst_() {
+        burst_send_active_ = false;
+        if (burst_final_speed_ >= 1) {
+            fan_power_state_ = 1;
+            fan_speed_state_ = burst_final_speed_;
+            state_dirty_ = true;
+        }
+        burst_final_speed_ = -1;
+        ESP_LOGI("cc1101_seq", "distinct-code burst complete");
+    }
 
-        rec_signal_detected_ = false;
-        rec_count_ = 0;
-
+    void start_listening_() {
+        if (!ready_ || listening_) return;
         radio_.setRx();
         pinMode(gdo2_, INPUT);
+        rec_count_ = 0;
+        rec_signal_detected_ = false;
         rec_initial_level_ = digitalRead(gdo2_);
         rec_last_us_ = micros();
         rec_active_ = true;
         attachInterrupt(digitalPinToInterrupt(gdo2_), rf_record_isr, CHANGE);
+        listening_ = true;
+    }
 
-        unsigned long start = millis();
-        while (!rec_signal_detected_ && (millis() - start < 10000)) {
-            delay(1);
-        }
-
-        if (rec_signal_detected_) {
-            delay(300);
-        }
-
+    void stop_listening_() {
+        if (!listening_) return;
         rec_active_ = false;
         detachInterrupt(digitalPinToInterrupt(gdo2_));
-        radio_.setIdle();
-
-        int count = rec_count_;
-
-        if (count < 20) {
-            ESP_LOGW("cc1101", "Too few transitions (%d). No signal captured.", count);
-            return;
-        }
-
-        ESP_LOGI("cc1101", "Captured %d transitions. Raw timings:", count);
-
-        // Log timings in chunks so they fit in log buffers
-        String timings_str = "[";
-        for (int i = 0; i < count; i++) {
-            if (i > 0) timings_str += ", ";
-            timings_str += String(rec_timings_[i]);
-            if (timings_str.length() > 400 || i == count - 1) {
-                if (i < count - 1) timings_str += ",";
-                ESP_LOGI("cc1101", "  %s", timings_str.c_str());
-                timings_str = "";
-            }
-        }
-        ESP_LOGI("cc1101", "]");
-
-        log_timing_analysis(count);
-        decode_signal(count);
+        listening_ = false;
     }
 
-private:
-    void log_timing_analysis(int count) {
-        int high_bins[13] = {};
-        int low_bins[13] = {};
-        int level = rec_initial_level_;
-        String edge_line;
+    void process_received_signal_(int count) {
+        static constexpr int MAX_DISCOVERY_CANDIDATES = 8;
+        uint32_t previous_message = 0;
+        bool have_previous = false;
+        int matched_frames = 0;
+        uint32_t discovery_messages[MAX_DISCOVERY_CANDIDATES] = {};
+        uint8_t discovery_counts[MAX_DISCOVERY_CANDIDATES] = {};
+        int discovery_candidate_count = 0;
 
-        ESP_LOGI("rf_timing", "Intervals are index:level/duration; level is RX output during that interval.");
-        for (int i = 0; i < count; i++) {
-            const int duration = rec_timings_[i];
-            if (duration >= 5000) {
-                ESP_LOGI("rf_timing", "GAP index=%d duration=%dus", i, duration);
-            } else {
-                int bin = duration / 100;
-                if (bin > 11) bin = 12;
-                if (level) high_bins[bin]++;
-                else low_bins[bin]++;
-                edge_line += String(i) + ":" + String(level) + "/" + String(duration) + " ";
-                if (edge_line.length() >= 220) {
-                    ESP_LOGI("rf_timing", "%s", edge_line.c_str());
-                    edge_line = "";
-                }
-            }
-            level = rec_levels_[i];
-        }
-        if (edge_line.length()) ESP_LOGI("rf_timing", "%s", edge_line.c_str());
-
-        for (int bin = 0; bin < 13; bin++) {
-            const int low = bin * 100;
-            if (bin == 12) {
-                if (high_bins[bin]) ESP_LOGI("rf_timing", "RX level 1: >=1200 us=%d samples", high_bins[bin]);
-                if (low_bins[bin]) ESP_LOGI("rf_timing", "RX level 0: >=1200 us=%d samples", low_bins[bin]);
-            } else {
-                const int high = low + 99;
-                if (high_bins[bin]) ESP_LOGI("rf_timing", "RX level 1: %d-%d us=%d samples", low, high, high_bins[bin]);
-                if (low_bins[bin]) ESP_LOGI("rf_timing", "RX level 0: %d-%d us=%d samples", low, high, low_bins[bin]);
-            }
-        }
-    }
-
-    void decode_signal(int count) {
-        int frames = 0;
-        uint32_t previous_in_capture = 0;
-        bool have_previous_in_capture = false;
-        uint32_t changed_in_capture = 0;
-        uint32_t first_message = 0;
-        static uint32_t previous_capture_message = 0;
-        static bool have_previous_capture = false;
-
-        // Use the next long gap as the end of a frame. Do not assume frame
-        // length or that the trailer is a parity bit: captures contain more
-        // symbols than the 29 address/command bits.
         for (int gap = 0; gap < count; gap++) {
             if (rec_timings_[gap] < 5000) continue;
             const int first_mark = gap + 1;
@@ -300,51 +467,117 @@ private:
             const int symbols = (intervals + 1) / 2;
             if (symbols < OOK_MSG_BITS || symbols > 60) continue;
 
-            char bits[61];
-            uint32_t message29 = 0;
+            uint32_t message = 0;
             bool valid = true;
-            for (int bit = 0; bit < symbols; bit++) {
+            for (int bit = 0; bit < OOK_MSG_BITS; bit++) {
                 const int mark_index = first_mark + bit * 2;
                 if (mark_index >= end) { valid = false; break; }
-                const bool one = rec_timings_[mark_index] > 500;
-                bits[bit] = one ? '1' : '0';
-                if (bit < OOK_MSG_BITS) message29 = (message29 << 1) | (one ? 1U : 0U);
+                message = (message << 1) | (rec_timings_[mark_index] > 500 ? 1U : 0U);
             }
             if (!valid) continue;
-            bits[symbols] = '\0';
 
-            const uint32_t address = (message29 >> 9) & 0xFFFFF;
-            const uint16_t command = message29 & 0x1FF;
-            const char *suffix = symbols > OOK_MSG_BITS ? bits + OOK_MSG_BITS : "(none)";
+            const uint32_t address = (message >> 9) & 0xFFFFF;
+            const uint16_t command = message & 0x1FF;
+            if (address != 0x94120) {
+                if (!discovery_mode_ || address == 0 || address == 0xFFFFF) continue;
+                int candidate = 0;
+                while (candidate < discovery_candidate_count &&
+                       discovery_messages[candidate] != message) candidate++;
+                if (candidate < discovery_candidate_count) {
+                    if (discovery_counts[candidate] < 0xFF) discovery_counts[candidate]++;
+                } else if (discovery_candidate_count < MAX_DISCOVERY_CANDIDATES) {
+                    discovery_messages[discovery_candidate_count] = message;
+                    discovery_counts[discovery_candidate_count] = 1;
+                    discovery_candidate_count++;
+                }
+                continue;
+            }
+            matched_frames++;
 
-            frames++;
-            if (frames == 1) first_message = message29;
-            if (have_previous_in_capture) changed_in_capture |= message29 ^ previous_in_capture;
-            previous_in_capture = message29;
-            have_previous_in_capture = true;
+            // A remote usually repeats one frame several times per press.
+            // Apply the press once so toggle commands do not toggle repeatedly.
+            if (have_previous && message == previous_message) continue;
+            previous_message = message;
+            have_previous = true;
+            observe_command_(address, command, true);
+            ESP_LOGI("cc1101_rx", "remote addr=0x%05lX cmd=0x%03X", (unsigned long)address, command);
 
-            ESP_LOGI("rf_decode", "Frame %d: symbols=%d addr=0x%05lX cmd=0x%03X suffix-after-29=%s bits=%s",
-                     frames, symbols, (unsigned long)address, (unsigned int)command, suffix, bits);
+            if (log_next_capture_)
+                ESP_LOGI("rf_decode", "matched address=0x%05lX command=0x%03X", (unsigned long)address, command);
         }
 
-        if (frames == 0) {
-            ESP_LOGW("rf_decode", "No frame with at least 29 symbols found.");
-            return;
+        // Ignore one-off noise: accept a new address only after the same
+        // address/command frame appears at least twice in the capture.
+        if (discovery_mode_) {
+            for (int i = 0; i < discovery_candidate_count; i++) {
+                if (discovery_counts[i] < 2) continue;
+                discovered_address_ = (int)((discovery_messages[i] >> 9) & 0xFFFFF);
+                discovery_mode_ = false;
+                state_dirty_ = true;
+                ESP_LOGI("cc1101_discovery", "found fan address 0x%05X", (unsigned int)discovered_address_);
+                break;
+            }
         }
-        ESP_LOGI("rf_decode", "Capture summary: %d frames; changed bits in first 29 symbols=0x%08lX",
-                 frames, (unsigned long)changed_in_capture);
-        if (have_previous_capture) {
-            const uint32_t delta = first_message ^ previous_capture_message;
-            ESP_LOGI("rf_decode", "First 29 symbols vs previous Record press: XOR=0x%08lX",
-                     (unsigned long)delta);
-            ESP_LOGI("rf_decode", "Changed address bits=0x%05lX; changed command bits=0x%03lX",
-                     (unsigned long)((delta >> 9) & 0xFFFFF),
-                     (unsigned long)(delta & 0x1FF));
-        } else {
-            ESP_LOGI("rf_decode", "Record again after another remote-button press to compare.");
+
+        if (log_next_capture_) {
+            ESP_LOGI("rf_decode", "capture edges=%d matched_frames=%d", count, matched_frames);
+            log_next_capture_ = false;
         }
-        previous_capture_message = first_message;
-        have_previous_capture = true;
+    }
+
+    void observe_command_(uint32_t address, uint16_t command, bool received) {
+        if (address != 0x94120) return;
+
+        for (auto &pool : pools_) {
+            if ((command & 0x1F0) != pool.prefix) continue;
+            uint8_t next = ((command & 0x0F) + pool.step) & 0x0F;
+            if (pool.excluded_nibble >= 0 && next == (pool.excluded_nibble & 0x0F))
+                next = (next + pool.step) & 0x0F;
+            pool.next_nibble = next;
+        }
+
+        last_fan_command_ = command;
+        state_dirty_ = true;
+
+        const uint32_t message = (address << 9) | command;
+        const uint32_t now = millis();
+        const bool repeated = received && message == last_observed_message_ &&
+                              (uint32_t)(now - last_observed_ms_) < 250U;
+        if (received) {
+            last_observed_message_ = message;
+            last_observed_ms_ = now;
+            last_remote_address_ = (int)address;
+            last_remote_command_ = command;
+        }
+        if (repeated) return;
+
+        if (command == FAN_CMD_SPEED1 || command == FAN_CMD_SPEED2 || command == FAN_CMD_SPEED3 ||
+            command == FAN_CMD_SPEED4 || command == FAN_CMD_SPEED5 || command == FAN_CMD_SPEED6) {
+            fan_power_state_ = 1;
+            if (command == FAN_CMD_SPEED1) fan_speed_state_ = 1;
+            else if (command == FAN_CMD_SPEED2) fan_speed_state_ = 2;
+            else if (command == FAN_CMD_SPEED3) fan_speed_state_ = 3;
+            else if (command == FAN_CMD_SPEED4) fan_speed_state_ = 4;
+            else if (command == FAN_CMD_SPEED5) fan_speed_state_ = 5;
+            else fan_speed_state_ = 6;
+        } else if (command == 0x093) {
+            fan_power_state_ = 0;
+            fan_speed_state_ = 0;
+        } else if (command == 0x020) {
+            fan_power_state_ = 1;
+        } else if (command == FAN_CMD_TOGGLE) {
+            if (fan_power_state_ >= 0) fan_power_state_ = !fan_power_state_;
+        } else if ((command & 0x1F0) == FAN_CMD_FASTER_PREFIX) {
+            fan_power_state_ = 1;
+            if (fan_speed_state_ >= 1 && fan_speed_state_ < 6) ++fan_speed_state_;
+        } else if ((command & 0x1F0) == FAN_CMD_SLOWER_PREFIX && command != FAN_CMD_SLOWER_PREFIX) {
+            fan_power_state_ = 1;
+            if (fan_speed_state_ > 1) --fan_speed_state_;
+        }
+
+        if ((command == FAN_CMD_LIGHT || (command & 0x1F0) == 0x160) &&
+            light_state_ >= 0)
+            light_state_ = !light_state_;
     }
 };
 
